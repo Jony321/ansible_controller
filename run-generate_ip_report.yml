@@ -16,7 +16,7 @@
         hyp_de_ips: "{{ (german_ip.split(',') if german_ip is string else german_ip) if german_ip is defined else [] }}"
         hyp_de_iface: "{{ german_interface | default('N/A') }}"
 
-- name: 2. Сбор сетевых фактов и генерация отчета
+- name: 2. Сбор фактов ВМ, анализ подсетей и генерация отчета
   hosts: vms, tg_proxy_hosts_v2, german_nic, hypervisors
   become: true
   gather_facts: true
@@ -32,7 +32,7 @@
       - "https://icanhazip.com"
 
   tasks:
-    # --- Блок сбора фактов для ВМ ---
+    # --- Блок сбора фактов с ВМ ---
     - name: Извлечение локальных IP интерфейсов ВМ
       ansible.builtin.set_fact:
         vm_ru_ip: "{{ ansible_ens3.ipv4.address | default(ansible_default_ipv4.address | default('N/A')) }}"
@@ -65,7 +65,7 @@
         seconds: 1
       when: "'hypervisors' not in group_names"
 
-    # --- Блок генерации отчета (выполняется локально ровно 1 раз) ---
+    # --- Блок сведения данных и анализа подсетей (на localhost) ---
     - name: Создание директории для отчетов
       ansible.builtin.file:
         path: "reports"
@@ -77,7 +77,109 @@
 
     - name: Формирование списка всех обработанных ВМ
       ansible.builtin.set_fact:
-        all_vm_hosts: "{{ (groups['vms'] | default([])) + (groups['tg_proxy_hosts_v2'] | default([])) + (groups['german_nic'] | default([])) | unique }}"
+        all_vm_hosts: "{{ ((groups['vms'] | default([])) + (groups['tg_proxy_hosts_v2'] | default([])) + (groups['german_nic'] | default([]))) | unique }}"
+      delegate_to: localhost
+      run_once: true
+      become: false
+
+    - name: Поиск файла subnets.json
+      ansible.builtin.set_fact:
+        subnets_file_path: "{{ item }}"
+      loop:
+        - "../terraform_kvm/subnets.json"
+        - "subnets.json"
+        - "{{ playbook_dir }}/../terraform_kvm/subnets.json"
+      when:
+        - subnets_file_path is not defined
+        - item is file
+      delegate_to: localhost
+      run_once: true
+      become: false
+
+    - name: Сбор карты всех активных IP-адресов из hostvars
+      ansible.builtin.set_fact:
+        active_ips_map: >-
+          {%- set ips = {} -%}
+          {%- for h in groups['hypervisors'] | default([]) -%}
+            {%- if hostvars[h].hyp_ru_ip is defined and hostvars[h].hyp_ru_ip != 'N/A' -%}
+              {%- set _ = ips.update({hostvars[h].hyp_ru_ip: 'Гипервизор ' ~ h}) -%}
+            {%- endif -%}
+            {%- if hostvars[h].hyp_de_ips is defined -%}
+              {%- for de_ip in hostvars[h].hyp_de_ips -%}
+                {%- set _ = ips.update({de_ip: 'Гипервизор DE ' ~ h}) -%}
+              {%- endfor -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {%- for h in all_vm_hosts -%}
+            {%- if hostvars[h].vm_ru_ip is defined and hostvars[h].vm_ru_ip != 'N/A' -%}
+              {%- set _ = ips.update({hostvars[h].vm_ru_ip: 'ВМ ' ~ h}) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ ips | to_json }}
+      delegate_to: localhost
+      run_once: true
+      become: false
+
+    - name: Расчет доступных, зарезервированных и заблокированных IP через Python
+      ansible.builtin.shell:
+        cmd: |
+          python3 - << 'EOF'
+          import json, sys
+          from ipaddress import ip_network
+
+          subnets_path = '''{{ subnets_file_path }}'''
+          active_ips = json.loads('''{{ active_ips_map }}''')
+
+          with open(subnets_path, 'r', encoding='utf-8') as f:
+              subnets = json.load(f)
+
+          results = []
+          for sub in subnets:
+              cidr = sub['cidr']
+              reserved = set(sub.get('reserved', []))
+              blocked = set(sub.get('blocked', []))
+              
+              net = ip_network(cidr)
+              usable = [str(ip) for ip in net.hosts()]
+              
+              used_in_sub = {}
+              free_in_sub = []
+              blocked_in_sub = []
+              reserved_in_sub = []
+
+              for ip in usable:
+                  if ip in reserved:
+                      reserved_in_sub.append(ip)
+                  elif ip in blocked:
+                      blocked_in_sub.append(ip)
+                  elif ip in active_ips:
+                      used_in_sub[ip] = active_ips[ip]
+                  else:
+                      free_in_sub.append(ip)
+
+              results.append({
+                  'cidr': cidr,
+                  'total': len(usable),
+                  'used_count': len(used_in_sub),
+                  'reserved_count': len(reserved_in_sub),
+                  'blocked_count': len(blocked_in_sub),
+                  'free_count': len(free_in_sub),
+                  'reserved': sorted(list(reserved_in_sub)),
+                  'blocked': sorted(list(blocked_in_sub)),
+                  'free': sorted(list(free_in_sub)),
+                  'used': used_in_sub
+              })
+
+          print(json.dumps(results))
+          EOF
+      register: python_subnet_calc
+      delegate_to: localhost
+      run_once: true
+      become: false
+
+    - name: Сохранение результата анализа подсетей в факт
+      ansible.builtin.set_fact:
+        subnet_analysis: "{{ python_subnet_calc.stdout | from_json }}"
       delegate_to: localhost
       run_once: true
       become: false
@@ -92,11 +194,18 @@
 
           ---
 
-          ## 🖥️ Физические гипервизоры
+          ## 📌 Оглавление
+          1. [🖥️ Физические гипервизоры](#1-физические-гипервизоры)
+          2. [💻 Виртуальные машины](#2-виртуальные-машины)
+          3. [🌐 Использование IP-адресов по подсетям](#3-использование-ip-адресов-по-подсетям)
+
+          ---
+
+          ## 1. 🖥️ Физические гипервизоры
 
           | Гипервизор | РФ IP (Интерфейс 1) | Германия IP (Интерфейс 2) | Инт. DE |
           | :--- | :--- | :--- | :--- |
-          {% for host in groups['hypervisors'] | default([]) %}
+          {% for host in groups['hypervisors'] | default([]) | sort %}
           {% if hostvars[host].hyp_ru_ip is defined %}
           | **{{ host }}** | {{ hostvars[host].hyp_ru_ip | default('N/A') }} | {{ hostvars[host].hyp_de_ips | default([]) | join(', ') }} | {{ hostvars[host].hyp_de_iface | default('N/A') }} |
           {% endif %}
@@ -104,14 +213,39 @@
 
           ---
 
-          ## 💻 Виртуальные машины
+          ## 2. 💻 Виртуальные машины
 
           | Виртуальная машина | РФ IP (ens3) | DE Серый IP (ens4) | DE Внешний IP (Фактический) |
           | :--- | :--- | :--- | :--- |
-          {% for host in all_vm_hosts %}
+          {% for host in all_vm_hosts | sort %}
           {% if hostvars[host].vm_ru_ip is defined %}
           | **{{ host }}** | {{ hostvars[host].vm_ru_ip | default('N/A') }} | {{ hostvars[host].vm_de_private_ip | default('N/A') }} | `{{ hostvars[host].vm_de_external_ip | default('N/A') }}` |
           {% endif %}
+          {% endfor %}
+
+          ---
+
+          ## 3. 🌐 Использование IP-адресов по подсетям
+
+          {% for sub in subnet_analysis %}
+          ### Подсеть: `{{ sub.cidr }}`
+          * **Всего хостов:** {{ sub.total }} | **Занято:** {{ sub.used_count }} | **Зарезервировано (GW/HSRP):** {{ sub.reserved_count }} | **Заблокировано:** {{ sub.blocked_count }} | **Свободно:** **{{ sub.free_count }}**
+
+          {% if sub.free %}
+          * 🟢 **Свободные IP:**
+          `{{ sub.free | join(', ') }}`
+          {% else %}
+          * ⚠️ **НЕТ СВОБОДНЫХ АДРЕСОВ**
+          {% endif %}
+
+          {% if sub.reserved %}
+          * 🟡 **Зарезервировано (GW/HSRP):** {{ sub.reserved | join(', ') }}
+          {% endif %}
+
+          {% if sub.blocked %}
+          * 🚫 **Заблокировано:** {{ sub.blocked | join(', ') }}
+          {% endif %}
+
           {% endfor %}
       delegate_to: localhost
       run_once: true
