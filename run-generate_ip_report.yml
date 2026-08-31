@@ -1,0 +1,133 @@
+#!/usr/bin/env -S ansible-playbook -e @vars/extra.yaml
+#
+# Playbook to determine and report the network configuration of hypervisors and virtual machines, including their internal and external IP addresses.
+#
+# > ./run-generate_ip_report.yml
+---
+- name: 1. Сбор сетевых фактов с Гипервизоров
+  hosts: hypervisors
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Фиксация фактов гипервизора
+      ansible.builtin.set_fact:
+        hyp_ru_ip: "{{ ansible_default_ipv4.address | default('N/A') }}"
+        hyp_de_ips: "{{ (german_ip.split(',') if german_ip is string else german_ip) if german_ip is defined else [] }}"
+        hyp_de_iface: "{{ german_interface | default('N/A') }}"
+
+- name: 2. Сбор сетевых фактов и генерация отчета
+  hosts: vms, tg_proxy_hosts_v2, german_nic, hypervisors
+  become: true
+  gather_facts: true
+  ignore_unreachable: true
+  throttle: 10
+
+  vars:
+    report_file: "reports/ip_inventory_report.md"
+    ip_echo_services:
+      - "https://checkip.amazonaws.com"
+      - "https://api.ipify.org"
+      - "https://ifconfig.co"
+      - "https://icanhazip.com"
+
+  tasks:
+    # --- Блок сбора фактов для ВМ ---
+    - name: Извлечение локальных IP интерфейсов ВМ
+      ansible.builtin.set_fact:
+        vm_ru_ip: "{{ ansible_ens3.ipv4.address | default(ansible_default_ipv4.address | default('N/A')) }}"
+        vm_de_private_ip: "{{ ansible_ens4.ipv4.address | default('N/A') }}"
+      when: "'hypervisors' not in group_names"
+
+    - name: Случайный выбор сервиса для проверки внешнего DE IP
+      ansible.builtin.set_fact:
+        selected_echo_service: "{{ ip_echo_services | random }}"
+      when: "'hypervisors' not in group_names"
+
+    - name: Проверка фактического внешнего DE IP через ротируемый сервис
+      ansible.builtin.shell:
+        cmd: "curl -s -4 --connect-timeout 5 {{ selected_echo_service }}"
+      register: external_ip_check
+      until: external_ip_check.rc == 0 and (external_ip_check.stdout | trim | regex_search('^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$'))
+      retries: 3
+      delay: 2
+      failed_when: false
+      changed_when: false
+      when: "'hypervisors' not in group_names"
+
+    - name: Сохранение результатов ВМ
+      ansible.builtin.set_fact:
+        vm_de_external_ip: "{{ external_ip_check.stdout | trim if (external_ip_check.rc == 0 and external_ip_check.stdout is defined) else 'Ошибка/Timeout' }}"
+      when: "'hypervisors' not in group_names"
+
+    - name: Пауза между запросами ВМ
+      ansible.builtin.pause:
+        seconds: 1
+      when: "'hypervisors' not in group_names"
+
+    # --- Блок генерации отчета (выполняется локально ровно 1 раз) ---
+    - name: Создание директории для отчетов
+      ansible.builtin.file:
+        path: "reports"
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
+      run_once: true
+      become: false
+
+    - name: Формирование списка всех обработанных ВМ
+      ansible.builtin.set_fact:
+        all_vm_hosts: "{{ (groups['vms'] | default([])) + (groups['tg_proxy_hosts_v2'] | default([])) + (groups['german_nic'] | default([])) | unique }}"
+      delegate_to: localhost
+      run_once: true
+      become: false
+
+    - name: Генерация отчета в формате Markdown
+      ansible.builtin.copy:
+        dest: "{{ report_file }}"
+        mode: '0644'
+        content: |
+          # 📊 Сводный отчет по сетевым адресам (RU / DE)
+          *Сгенерировано автоматически:* {{ lookup('pipe', 'date "+%Y-%m-%d %H:%M:%S"') }}
+
+          ---
+
+          ## 🖥️ Физические гипервизоры
+
+          | Гипервизор | РФ IP (Интерфейс 1) | Германия IP (Интерфейс 2) | Инт. DE |
+          | :--- | :--- | :--- | :--- |
+          {% for host in groups['hypervisors'] | default([]) %}
+          {% if hostvars[host].hyp_ru_ip is defined %}
+          | **{{ host }}** | {{ hostvars[host].hyp_ru_ip | default('N/A') }} | {{ hostvars[host].hyp_de_ips | default([]) | join(', ') }} | {{ hostvars[host].hyp_de_iface | default('N/A') }} |
+          {% endif %}
+          {% endfor %}
+
+          ---
+
+          ## 💻 Виртуальные машины
+
+          | Виртуальная машина | РФ IP (ens3) | DE Серый IP (ens4) | DE Внешний IP (Фактический) |
+          | :--- | :--- | :--- | :--- |
+          {% for host in all_vm_hosts %}
+          {% if hostvars[host].vm_ru_ip is defined %}
+          | **{{ host }}** | {{ hostvars[host].vm_ru_ip | default('N/A') }} | {{ hostvars[host].vm_de_private_ip | default('N/A') }} | `{{ hostvars[host].vm_de_external_ip | default('N/A') }}` |
+          {% endif %}
+          {% endfor %}
+      delegate_to: localhost
+      run_once: true
+      become: false
+
+    - name: Чтение сгенерированного отчета
+      ansible.builtin.slurp:
+        src: "{{ report_file }}"
+      register: slurped_report
+      delegate_to: localhost
+      run_once: true
+      become: false
+
+    - name: 📋 ВЫВОД ОТЧЕТА В КОНСОЛЬ
+      ansible.builtin.debug:
+        msg: "{{ slurped_report.content | b64decode }}"
+      delegate_to: localhost
+      run_once: true
+      become: false
