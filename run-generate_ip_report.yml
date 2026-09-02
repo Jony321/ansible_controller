@@ -1,8 +1,3 @@
-#!/usr/bin/env -S ansible-playbook -e @vars/extra.yaml
-#
-# Playbook to determine and report the network configuration of hypervisors and virtual machines, including their internal and external IP addresses.
-#
-# > ./run-generate_ip_report.yml
 ---
 - name: 1. Сбор сетевых фактов с Гипервизоров
   hosts: hypervisors
@@ -14,17 +9,15 @@
       ansible.builtin.set_fact:
         hyp_ru_ip: "{{ ansible_default_ipv4.address | default('N/A') }}"
         hyp_de_ips: "{{ (german_ip.split(',') if german_ip is string else german_ip) if german_ip is defined else [] }}"
-        hyp_de_iface: "{{ german_interface | default('N/A') }}"
 
-- name: 2. Сбор фактов ВМ, анализ подсетей и генерация отчета
-  hosts: vms, tg_proxy_hosts_v2, german_nic, hypervisors
+- name: 2. Сбор фактов ВМ и строчный консольный вывод
+  hosts: tg_proxy_hosts_v2, hypervisors
   become: true
   gather_facts: true
   ignore_unreachable: true
   throttle: 10
 
   vars:
-    report_file: "reports/ip_inventory_report.md"
     ip_echo_services:
       - "https://checkip.amazonaws.com"
       - "https://api.ipify.org"
@@ -32,108 +25,152 @@
       - "https://icanhazip.com"
 
   tasks:
-    # --- Блок сбора фактов с ВМ ---
-    - name: Извлечение локальных IP интерфейсов ВМ
+    - name: Сбор всех IPv4 адресов ВМ
       ansible.builtin.set_fact:
-        vm_ru_ip: "{{ ansible_ens3.ipv4.address | default(ansible_default_ipv4.address | default('N/A')) }}"
-        vm_de_private_ip: "{{ ansible_ens4.ipv4.address | default('N/A') }}"
+        vm_ipv4_list: "{{ (ansible_all_ipv4_addresses | default([])) + ([ansible_host] if ansible_host is defined else []) }}"
+        vm_de_private_ip: "{{ (ansible_all_ipv4_addresses | default([])) | select('search', '^10\\.99\\.0\\.') | first | default('N/A') }}"
       when: "'hypervisors' not in group_names"
 
     - name: Случайный выбор сервиса для проверки внешнего DE IP
       ansible.builtin.set_fact:
         selected_echo_service: "{{ ip_echo_services | random }}"
-      when: "'hypervisors' not in group_names"
+      when:
+        - "'hypervisors' not in group_names"
+        - "vm_de_private_ip != 'N/A'"
 
-    - name: Проверка фактического внешнего DE IP через ротируемый сервис
+    - name: Проверка фактического внешнего DE IP (только для ВМ с 2-м интерфейсом)
       ansible.builtin.shell:
         cmd: "curl -s -4 --connect-timeout 5 {{ selected_echo_service }}"
       register: external_ip_check
-      until: external_ip_check.rc == 0 and (external_ip_check.stdout | trim | regex_search('^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$'))
+      until: external_ip_check.rc == 0 and (external_ip_check.stdout | trim is match('^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$'))
       retries: 3
       delay: 2
       failed_when: false
       changed_when: false
-      when: "'hypervisors' not in group_names"
+      when:
+        - "'hypervisors' not in group_names"
+        - "vm_de_private_ip != 'N/A'"
 
-    - name: Сохранение результатов ВМ
+    - name: Безопасное сохранение внешнего DE IP ВМ
       ansible.builtin.set_fact:
-        vm_de_external_ip: "{{ external_ip_check.stdout | trim if (external_ip_check.rc == 0 and external_ip_check.stdout is defined) else 'Ошибка/Timeout' }}"
+        vm_de_external_ip: "{{ external_ip_check.stdout | trim if (external_ip_check is defined and external_ip_check.rc is defined and external_ip_check.rc == 0 and external_ip_check.stdout is defined) else '' }}"
       when: "'hypervisors' not in group_names"
 
     - name: Пауза между запросами ВМ
       ansible.builtin.pause:
         seconds: 1
-      when: "'hypervisors' not in group_names"
+      when:
+        - "'hypervisors' not in group_names"
+        - "vm_de_private_ip != 'N/A'"
 
-    # --- Блок сведения данных и анализа подсетей (на localhost) ---
-    - name: Создание директории для отчетов
-      ansible.builtin.file:
-        path: "reports"
-        state: directory
-        mode: '0755'
-      delegate_to: localhost
-      run_once: true
-      become: false
-
-    - name: Формирование списка всех обработанных ВМ
+    # --- Обработка и сохранение отчета на localhost ---
+    - name: Сбор структуры всех узлов и их адресов
       ansible.builtin.set_fact:
         all_vm_hosts: "{{ ((groups['vms'] | default([])) + (groups['tg_proxy_hosts_v2'] | default([])) + (groups['german_nic'] | default([]))) | unique }}"
-      delegate_to: localhost
-      run_once: true
-      become: false
-
-    - name: Поиск файла subnets.json
-      ansible.builtin.set_fact:
-        subnets_file_path: "{{ item }}"
-      loop:
-        - "../terraform_kvm/subnets.json"
-        - "subnets.json"
-        - "{{ playbook_dir }}/../terraform_kvm/subnets.json"
-      when:
-        - subnets_file_path is not defined
-        - item is file
-      delegate_to: localhost
-      run_once: true
-      become: false
-
-    - name: Сбор карты всех активных IP-адресов из hostvars
-      ansible.builtin.set_fact:
-        active_ips_map: >-
-          {%- set ips = {} -%}
+        vm_facts_map: >-
+          {%- set vms = {} -%}
+          {%- for h in ((groups['vms'] | default([])) + (groups['tg_proxy_hosts_v2'] | default([])) + (groups['german_nic'] | default([]))) | unique -%}
+            {%- if hostvars[h].vm_ipv4_list is defined -%}
+              {%- set de_priv = hostvars[h].vm_de_private_ip | default('N/A') -%}
+              {%- set de_ext = hostvars[h].vm_de_external_ip | default('') -%}
+              {%- set _ = vms.update({h: {'ips': hostvars[h].vm_ipv4_list, 'de_private': de_priv, 'de_external': de_ext}}) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ vms | to_json }}
+        hypers_facts_map: >-
+          {%- set hypers = {} -%}
           {%- for h in groups['hypervisors'] | default([]) -%}
             {%- if hostvars[h].hyp_ru_ip is defined and hostvars[h].hyp_ru_ip != 'N/A' -%}
-              {%- set _ = ips.update({hostvars[h].hyp_ru_ip: 'Гипервизор ' ~ h}) -%}
-            {%- endif -%}
-            {%- if hostvars[h].hyp_de_ips is defined -%}
-              {%- for de_ip in hostvars[h].hyp_de_ips -%}
-                {%- set _ = ips.update({de_ip: 'Гипервизор DE ' ~ h}) -%}
-              {%- endfor -%}
+              {%- set de_list = hostvars[h].hyp_de_ips | default([]) -%}
+              {%- set de_str = de_list if (de_list is string) else (de_list | join(', ')) -%}
+              {%- set _ = hypers.update({h: {'ru_ip': hostvars[h].hyp_ru_ip, 'de_external': de_str}}) -%}
             {%- endif -%}
           {%- endfor -%}
-          {%- for h in all_vm_hosts -%}
-            {%- if hostvars[h].vm_ru_ip is defined and hostvars[h].vm_ru_ip != 'N/A' -%}
-              {%- set _ = ips.update({hostvars[h].vm_ru_ip: 'ВМ ' ~ h}) -%}
-            {%- endif -%}
-          {%- endfor -%}
-          {{ ips | to_json }}
+          {{ hypers | to_json }}
       delegate_to: localhost
       run_once: true
       become: false
 
-    - name: Расчет доступных, зарезервированных и заблокированных IP через Python
+    - name: Генерация отчета в /tmp/ip_inventory_report.txt через Python
       ansible.builtin.shell:
         cmd: |
           python3 - << 'EOF'
-          import json, sys
-          from ipaddress import ip_network
+          import json, os, sys
+          from ipaddress import ip_network, ip_address
 
-          subnets_path = '''{{ subnets_file_path }}'''
-          active_ips = json.loads('''{{ active_ips_map }}''')
+          possible_paths = [
+              "../terraform_kvm/subnets.json",
+              "subnets.json",
+              "{{ playbook_dir }}/../terraform_kvm/subnets.json",
+              "{{ playbook_dir }}/subnets.json"
+          ]
+          
+          subnets_path = None
+          for p in possible_paths:
+              if os.path.exists(p):
+                  subnets_path = p
+                  break
+
+          if not subnets_path:
+              print("ERROR: subnets.json file not found in any known path!")
+              sys.exit(1)
+
+          vms_data = json.loads('''{{ vm_facts_map }}''')
+          hypers_data = json.loads('''{{ hypers_facts_map }}''')
 
           with open(subnets_path, 'r', encoding='utf-8') as f:
               subnets = json.load(f)
 
-          results = []
+          # Маппинг публичных IP на инфу об узлах: ip -> {name, de_private, de_external}
+          active_ips = {}
+
+          # 1. Привязываем гипервизоры
+          for h_name, h_info in hypers_data.items():
+              ru_ip = h_info.get('ru_ip')
+              if ru_ip:
+                  active_ips[ru_ip] = {
+                      'name': h_name,
+                      'de_private': 'N/A',
+                      'de_external': h_info.get('de_external', '')
+                  }
+
+          # 2. Математически сопоставляем IP ВМ с известными подсетями
+          all_nets = [ip_network(s['cidr']) for s in subnets]
+
+          for vm_name, vm_info in vms_data.items():
+              ip_candidates = vm_info.get('ips', [])
+              de_priv = vm_info.get('de_private', 'N/A')
+              de_ext = vm_info.get('de_external', '')
+
+              for cand in ip_candidates:
+                  try:
+                      cand_obj = ip_address(cand)
+                      # Игнорируем loopback и немецкую серую сеть
+                      if cand_obj.is_loopback or cand.startswith("10.99.0."):
+                          continue
+                      
+                      # Проверяем вхождение в любую из наших подсетей
+                      for net in all_nets:
+                          if cand_obj in net:
+                              active_ips[cand] = {
+                                  'name': vm_name,
+                                  'de_private': de_priv,
+                                  'de_external': de_ext
+                              }
+                              break
+                  except ValueError:
+                      continue
+
+          # 3. Формируем 3 Блока Вывода
+          b1_lines = ["=== SUBNETS & FREE COUNT ==="]
+          b2_lines = ["=== BLOCKED ADDRESSES ==="]
+          b3_lines = [
+              "=== ALL IP ADDRESSES ===",
+              "1st nic - hostname - 2nd nic - external ip"
+          ]
+
+          all_blocked = []
+
           for sub in subnets:
               cidr = sub['cidr']
               reserved = set(sub.get('reserved', []))
@@ -142,126 +179,49 @@
               net = ip_network(cidr)
               usable = [str(ip) for ip in net.hosts()]
               
-              used_in_sub = {}
-              free_in_sub = []
-              blocked_in_sub = []
-              reserved_in_sub = []
+              free_count = 0
+              for ip in usable:
+                  if ip not in reserved and ip not in blocked and ip not in active_ips:
+                      free_count += 1
+                      
+              b1_lines.append(f"{cidr} - free: {free_count}")
+
+              for b_ip in sorted(list(blocked), key=lambda x: ip_address(x)):
+                  all_blocked.append(b_ip)
 
               for ip in usable:
-                  if ip in reserved:
-                      reserved_in_sub.append(ip)
+                  if ip in active_ips:
+                      info = active_ips[ip]
+                      host_name = info['name']
+                      
+                      de_priv = info.get('de_private', '').strip()
+                      nic2_display = de_priv if (de_priv and de_priv != 'N/A') else 'N/A'
+                      
+                      de_ext = info.get('de_external', '').strip()
+                      if not de_ext or de_ext == ip or de_ext in ['N/A', 'TIMEOUT/ERROR']:
+                          ext_display = 'N/A'
+                      else:
+                          ext_display = de_ext
+
+                      b3_lines.append(f"{ip} - {host_name} - {nic2_display} - {ext_display}")
+                  elif ip in reserved:
+                      b3_lines.append(f"{ip} - reserved")
                   elif ip in blocked:
-                      blocked_in_sub.append(ip)
-                  elif ip in active_ips:
-                      used_in_sub[ip] = active_ips[ip]
+                      b3_lines.append(f"{ip} - blocked")
                   else:
-                      free_in_sub.append(ip)
+                      b3_lines.append(f"{ip}")
 
-              results.append({
-                  'cidr': cidr,
-                  'total': len(usable),
-                  'used_count': len(used_in_sub),
-                  'reserved_count': len(reserved_in_sub),
-                  'blocked_count': len(blocked_in_sub),
-                  'free_count': len(free_in_sub),
-                  'reserved': sorted(list(reserved_in_sub)),
-                  'blocked': sorted(list(blocked_in_sub)),
-                  'free': sorted(list(free_in_sub)),
-                  'used': used_in_sub
-              })
+          if all_blocked:
+              for b in all_blocked:
+                  b2_lines.append(f"{b}")
+          else:
+              b2_lines.append("none")
 
-          print(json.dumps(results))
+          output = "\n".join(b1_lines) + "\n\n" + "\n".join(b2_lines) + "\n\n" + "\n".join(b3_lines)
+          
+          with open('/tmp/ip_inventory_report.txt', 'w', encoding='utf-8') as out_file:
+              out_file.write(output)
           EOF
-      register: python_subnet_calc
-      delegate_to: localhost
-      run_once: true
-      become: false
-
-    - name: Сохранение результата анализа подсетей в факт
-      ansible.builtin.set_fact:
-        subnet_analysis: "{{ python_subnet_calc.stdout | from_json }}"
-      delegate_to: localhost
-      run_once: true
-      become: false
-
-    - name: Генерация отчета в формате Markdown
-      ansible.builtin.copy:
-        dest: "{{ report_file }}"
-        mode: '0644'
-        content: |
-          # 📊 Сводный отчет по сетевым адресам (RU / DE)
-          *Сгенерировано автоматически:* {{ lookup('pipe', 'date "+%Y-%m-%d %H:%M:%S"') }}
-
-          ---
-
-          ## 📌 Оглавление
-          1. [🖥️ Физические гипервизоры](#1-физические-гипервизоры)
-          2. [💻 Виртуальные машины](#2-виртуальные-машины)
-          3. [🌐 Использование IP-адресов по подсетям](#3-использование-ip-адресов-по-подсетям)
-
-          ---
-
-          ## 1. 🖥️ Физические гипервизоры
-
-          | Гипервизор | РФ IP (Интерфейс 1) | Германия IP (Интерфейс 2) | Инт. DE |
-          | :--- | :--- | :--- | :--- |
-          {% for host in groups['hypervisors'] | default([]) | sort %}
-          {% if hostvars[host].hyp_ru_ip is defined %}
-          | **{{ host }}** | {{ hostvars[host].hyp_ru_ip | default('N/A') }} | {{ hostvars[host].hyp_de_ips | default([]) | join(', ') }} | {{ hostvars[host].hyp_de_iface | default('N/A') }} |
-          {% endif %}
-          {% endfor %}
-
-          ---
-
-          ## 2. 💻 Виртуальные машины
-
-          | Виртуальная машина | РФ IP (ens3) | DE Серый IP (ens4) | DE Внешний IP (Фактический) |
-          | :--- | :--- | :--- | :--- |
-          {% for host in all_vm_hosts | sort %}
-          {% if hostvars[host].vm_ru_ip is defined %}
-          | **{{ host }}** | {{ hostvars[host].vm_ru_ip | default('N/A') }} | {{ hostvars[host].vm_de_private_ip | default('N/A') }} | `{{ hostvars[host].vm_de_external_ip | default('N/A') }}` |
-          {% endif %}
-          {% endfor %}
-
-          ---
-
-          ## 3. 🌐 Использование IP-адресов по подсетям
-
-          {% for sub in subnet_analysis %}
-          ### Подсеть: `{{ sub.cidr }}`
-          * **Всего хостов:** {{ sub.total }} | **Занято:** {{ sub.used_count }} | **Зарезервировано (GW/HSRP):** {{ sub.reserved_count }} | **Заблокировано:** {{ sub.blocked_count }} | **Свободно:** **{{ sub.free_count }}**
-
-          {% if sub.free %}
-          * 🟢 **Свободные IP:**
-          `{{ sub.free | join(', ') }}`
-          {% else %}
-          * ⚠️ **НЕТ СВОБОДНЫХ АДРЕСОВ**
-          {% endif %}
-
-          {% if sub.reserved %}
-          * 🟡 **Зарезервировано (GW/HSRP):** {{ sub.reserved | join(', ') }}
-          {% endif %}
-
-          {% if sub.blocked %}
-          * 🚫 **Заблокировано:** {{ sub.blocked | join(', ') }}
-          {% endif %}
-
-          {% endfor %}
-      delegate_to: localhost
-      run_once: true
-      become: false
-
-    - name: Чтение сгенерированного отчета
-      ansible.builtin.slurp:
-        src: "{{ report_file }}"
-      register: slurped_report
-      delegate_to: localhost
-      run_once: true
-      become: false
-
-    - name: 📋 ВЫВОД ОТЧЕТА В КОНСОЛЬ
-      ansible.builtin.debug:
-        msg: "{{ slurped_report.content | b64decode }}"
       delegate_to: localhost
       run_once: true
       become: false
