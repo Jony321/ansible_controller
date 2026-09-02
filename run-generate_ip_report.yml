@@ -11,7 +11,7 @@
         hyp_de_ips: "{{ (german_ip.split(',') if german_ip is string else german_ip) if german_ip is defined else [] }}"
 
 - name: 2. Сбор фактов ВМ и строчный консольный вывод
-  hosts: tg_proxy_hosts_v2, hypervisors
+  hosts: vms, tg_proxy_hosts_v2, german_nic, hypervisors
   become: true
   gather_facts: true
   ignore_unreachable: true
@@ -25,20 +25,19 @@
       - "https://icanhazip.com"
 
   tasks:
-    - name: Сбор всех IPv4 адресов ВМ
+    # --- Сбор фактов с ВМ ---
+    - name: Извлечение локальных IP интерфейсов ВМ (без привязки к ens3/ens4/ens8)
       ansible.builtin.set_fact:
-        vm_ipv4_list: "{{ (ansible_all_ipv4_addresses | default([])) + ([ansible_host] if ansible_host is defined else []) }}"
+        vm_ru_ip: "{{ (ansible_all_ipv4_addresses | default([])) | reject('search', '^10\\.99\\.0\\.') | reject('equalto', '127.0.0.1') | first | default(ansible_default_ipv4.address | default('N/A')) }}"
         vm_de_private_ip: "{{ (ansible_all_ipv4_addresses | default([])) | select('search', '^10\\.99\\.0\\.') | first | default('N/A') }}"
       when: "'hypervisors' not in group_names"
 
-    - name: Случайный выбор сервиса для проверки внешнего DE IP
+    - name: Случайный выбор сервиса для проверки внешнего IP
       ansible.builtin.set_fact:
         selected_echo_service: "{{ ip_echo_services | random }}"
-      when:
-        - "'hypervisors' not in group_names"
-        - "vm_de_private_ip != 'N/A'"
+      when: "'hypervisors' not in group_names"
 
-    - name: Проверка фактического внешнего DE IP (только для ВМ с 2-м интерфейсом)
+    - name: Проверка фактического внешнего IP через ротируемый сервис
       ansible.builtin.shell:
         cmd: "curl -s -4 --connect-timeout 5 {{ selected_echo_service }}"
       register: external_ip_check
@@ -47,11 +46,9 @@
       delay: 2
       failed_when: false
       changed_when: false
-      when:
-        - "'hypervisors' not in group_names"
-        - "vm_de_private_ip != 'N/A'"
+      when: "'hypervisors' not in group_names"
 
-    - name: Безопасное сохранение внешнего DE IP ВМ
+    - name: Безопасное сохранение внешнего IP ВМ
       ansible.builtin.set_fact:
         vm_de_external_ip: "{{ external_ip_check.stdout | trim if (external_ip_check is defined and external_ip_check.rc is defined and external_ip_check.rc == 0 and external_ip_check.stdout is defined) else '' }}"
       when: "'hypervisors' not in group_names"
@@ -59,9 +56,7 @@
     - name: Пауза между запросами ВМ
       ansible.builtin.pause:
         seconds: 1
-      when:
-        - "'hypervisors' not in group_names"
-        - "vm_de_private_ip != 'N/A'"
+      when: "'hypervisors' not in group_names"
 
     # --- Обработка и сохранение отчета на localhost ---
     - name: Сбор структуры всех узлов и их адресов
@@ -70,10 +65,11 @@
         vm_facts_map: >-
           {%- set vms = {} -%}
           {%- for h in ((groups['vms'] | default([])) + (groups['tg_proxy_hosts_v2'] | default([])) + (groups['german_nic'] | default([]))) | unique -%}
-            {%- if hostvars[h].vm_ipv4_list is defined -%}
+            {%- if hostvars[h].vm_ru_ip is defined or hostvars[h].ansible_all_ipv4_addresses is defined -%}
+              {%- set ip_list = (hostvars[h].ansible_all_ipv4_addresses | default([])) + ([hostvars[h].ansible_host] if hostvars[h].ansible_host is defined else []) -%}
               {%- set de_priv = hostvars[h].vm_de_private_ip | default('N/A') -%}
               {%- set de_ext = hostvars[h].vm_de_external_ip | default('') -%}
-              {%- set _ = vms.update({h: {'ips': hostvars[h].vm_ipv4_list, 'de_private': de_priv, 'de_external': de_ext}}) -%}
+              {%- set _ = vms.update({h: {'ips': ip_list, 'de_private': de_priv, 'de_external': de_ext}}) -%}
             {%- endif -%}
           {%- endfor -%}
           {{ vms | to_json }}
@@ -121,10 +117,9 @@
           with open(subnets_path, 'r', encoding='utf-8') as f:
               subnets = json.load(f)
 
-          # Маппинг публичных IP на инфу об узлах: ip -> {name, de_private, de_external}
           active_ips = {}
 
-          # 1. Привязываем гипервизоры
+          # 1. Заносим гипервизоры
           for h_name, h_info in hypers_data.items():
               ru_ip = h_info.get('ru_ip')
               if ru_ip:
@@ -134,7 +129,7 @@
                       'de_external': h_info.get('de_external', '')
                   }
 
-          # 2. Математически сопоставляем IP ВМ с известными подсетями
+          # 2. Заносим ВМ
           all_nets = [ip_network(s['cidr']) for s in subnets]
 
           for vm_name, vm_info in vms_data.items():
@@ -145,11 +140,9 @@
               for cand in ip_candidates:
                   try:
                       cand_obj = ip_address(cand)
-                      # Игнорируем loopback и немецкую серую сеть
                       if cand_obj.is_loopback or cand.startswith("10.99.0."):
                           continue
                       
-                      # Проверяем вхождение в любую из наших подсетей
                       for net in all_nets:
                           if cand_obj in net:
                               active_ips[cand] = {
@@ -161,7 +154,7 @@
                   except ValueError:
                       continue
 
-          # 3. Формируем 3 Блока Вывода
+          # 3. Формирование блоков вывода
           b1_lines = ["=== SUBNETS & FREE COUNT ==="]
           b2_lines = ["=== BLOCKED ADDRESSES ==="]
           b3_lines = [
@@ -194,11 +187,13 @@
                       info = active_ips[ip]
                       host_name = info['name']
                       
+                      # 2nd nic (серый IP)
                       de_priv = info.get('de_private', '').strip()
                       nic2_display = de_priv if (de_priv and de_priv != 'N/A') else 'N/A'
                       
+                      # external ip (резолв через curl)
                       de_ext = info.get('de_external', '').strip()
-                      if not de_ext or de_ext == ip or de_ext in ['N/A', 'TIMEOUT/ERROR']:
+                      if not de_ext or de_ext in ['N/A', 'TIMEOUT/ERROR', 'None']:
                           ext_display = 'N/A'
                       else:
                           ext_display = de_ext
