@@ -11,7 +11,7 @@
         hyp_de_ips: "{{ (german_ip.split(',') if german_ip is string else german_ip) if german_ip is defined else [] }}"
 
 - name: 2. Сбор фактов ВМ и строчный консольный вывод
-  hosts: vms, tg_proxy_hosts_v2, german_nic, hypervisors
+  hosts: hypervisors
   become: true
   gather_facts: true
   ignore_unreachable: true
@@ -95,10 +95,7 @@
           from ipaddress import ip_network, ip_address
 
           possible_paths = [
-              "../terraform_kvm/subnets.json",
-              "subnets.json",
-              "{{ playbook_dir }}/../terraform_kvm/subnets.json",
-              "{{ playbook_dir }}/subnets.json"
+              "../../subnets.json",
           ]
           
           subnets_path = None
