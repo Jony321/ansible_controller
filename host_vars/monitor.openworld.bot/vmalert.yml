@@ -29,6 +29,18 @@ vmalert_templates_include:
   - node_exporter_cpu.yml
 
 vmalert_additional_alerts:
+  - filename: xray_recordings.yml
+    data:
+      groups:
+        - name: xray_central_recordings
+          interval: 1m
+          rules:
+            - record: xray:top50_users_connections_5m:increase
+              expr: |
+                topk(50, sum by (country, telegram_id) (xray:user_total_connections_5m:increase))
+              labels:
+                aggregation: top50_users
+                retention: "2d"
   - filename: xray_anomalies.yml
     data:
       groups:
