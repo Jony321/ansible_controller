@@ -65,5 +65,14 @@ alertmanager_config:
       api_url: "https://api.telegram.org"
       bot_token: "{{ vault_alertmanager_bot_token }}"
       chat_id: -5007174653
-      message: !unsafe '{{ template "telegram.default.message" . }}'
+      message: !unsafe |
+        {{- if eq .CommonLabels.alertname "CpuLoad" -}}
+          {{- if eq .Status "firing" -}}
+            🔥 <b>CpuLoad</b> ({{ .CommonLabels.severity }}) — CPU load more than 90% for {{ len .Alerts.Firing }} host(s).
+          {{- else -}}
+            ✅ <b>CpuLoad</b> ({{ .CommonLabels.severity }}) — CPU load is back to normal for all hosts.
+          {{- end -}}
+        {{- else -}}
+          {{ template "telegram.default.message" . }}
+        {{- end -}}
       parse_mode: HTML
