@@ -504,7 +504,7 @@ ru.ix.hyper11.wx.021 ansible_ip=78.24.92.62 server_type=WX provider=colocation c
 ru.ix.hyper11.wx.022 ansible_ip=78.24.92.63 server_type=WX provider=colocation country=RU
 ru.ix.hyper11.wx.023 ansible_ip=78.24.92.64 server_type=WX provider=colocation country=RU
 ru.ix.hyper11.wx.024 ansible_ip=78.24.92.65 server_type=WX provider=colocation country=RU
-ru.ix.hyper11.wx.025 ansible_ip=78.24.92.66 server_type=WX provider=colocation country=RU
+ru.ix.hyper11.wx.025 ansible_ip=78.24.92.83 server_type=WX provider=colocation country=RU
 ru.ix.hyper11.wx.026 ansible_ip=78.24.92.67 server_type=WX provider=colocation country=RU
 ru.ix.hyper11.wx.027 ansible_ip=78.24.92.68 server_type=WX provider=colocation country=RU
 ru.ix.hyper11.wx.028 ansible_ip=78.24.92.69 server_type=WX provider=colocation country=RU
