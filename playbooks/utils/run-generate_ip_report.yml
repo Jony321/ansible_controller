@@ -11,7 +11,7 @@
         hyp_de_ips: "{{ (german_ip.split(',') if german_ip is string else german_ip) if german_ip is defined else [] }}"
 
 - name: 2. Сбор фактов ВМ и строчный консольный вывод
-  hosts: hypervisors
+  hosts: tg_proxy_hosts_v2
   become: true
   gather_facts: true
   ignore_unreachable: true
