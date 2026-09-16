@@ -27,3 +27,85 @@ vmalert_swarm_deploy:
 
 vmalert_templates_include:
   - node_exporter_cpu.yml
+
+vmalert_additional_alerts:
+  - filename: xray_recordings.yml
+    data:
+      groups:
+        - name: xray_central_recordings
+          interval: 1m
+          rules:
+            - record: xray:top50_users_connections_5m:increase
+              expr: |
+                topk(50, sum by (country, telegram_id) (xray:user_total_connections_5m:increase))
+              labels:
+                aggregation: top50_users
+                retention: "2d"
+  - filename: xray_anomalies.yml
+    data:
+      groups:
+        - name: xray_anomaly_alerts
+          rules:
+            - alert: XRayAnomalousUserActivity
+              expr: |
+                (sum by (country, telegram_id) (xray:user_total_connections_5m:increase) > 2000)
+                > on(country) group_left() xray:user_connections_5m:p99_99
+                and on(country) (
+                  xray:user_connections_5m:p99_99 > 3 * xray:user_connections_5m:p99_5
+                )
+              for: 15m
+              labels:
+                severity: warning
+                project: akh
+                percentile: "99.99"
+              annotations:
+                summary: !unsafe "👤 [{{ $labels.country }}] {{ $labels.telegram_id }} | {{ $value | humanize }} конн. | p99.99%"
+                summary_resolved: !unsafe "{{ $labels.telegram_id }} / {{ $value | humanize }} conn. anomaly is resolved."
+
+            - alert: XRayAnomalousUserActivity
+              expr: |
+                (sum by (country, telegram_id) (xray:user_total_connections_5m:increase) > 2000)
+                > on(country) group_left() xray:user_connections_5m:p99_5
+                and on(country) (
+                  xray:user_connections_5m:p99_5 > 3 * xray:user_connections_5m:p99
+                )
+              for: 15m
+              labels:
+                severity: warning
+                project: akh
+                percentile: "99.5"
+              annotations:
+                summary: !unsafe "👤 [{{ $labels.country }}] {{ $labels.telegram_id }} | {{ $value | humanize }} конн. | p99.5%"
+                summary_resolved: !unsafe "{{ $labels.telegram_id }} / {{ $value | humanize }} conn. anomaly is resolved."
+
+            - alert: XRayAnomalousUserActivity
+              expr: |
+                (sum by (country, telegram_id) (xray:user_total_connections_5m:increase) > 2000)
+                > on(country) group_left() xray:user_connections_5m:p99
+                and on(country) (
+                  xray:user_connections_5m:p99 > 3 * xray:user_connections_5m:p95
+                )
+              for: 15m
+              labels:
+                severity: warning
+                project: akh
+                percentile: "99.0"
+              annotations:
+                summary: !unsafe "👤 [{{ $labels.country }}] {{ $labels.telegram_id }} | {{ $value | humanize }} конн. | p99.0%"
+                summary_resolved: !unsafe "{{ $labels.telegram_id }} / {{ $value | humanize }} conn. anomaly is resolved."
+
+            - alert: XRayAnomalousUserActivity
+              expr: |
+                (sum by (country, telegram_id) (xray:user_total_connections_5m:increase) > 2000)
+                > on(country) group_left() xray:user_connections_5m:p95
+                and on(country) (
+                  xray:user_connections_5m:p95 > 3 * xray:user_connections_5m:p90
+                )
+              for: 15m
+              labels:
+                severity: warning
+                project: akh
+                percentile: "95.0"
+              annotations:
+                summary: !unsafe "👤 [{{ $labels.country }}] {{ $labels.telegram_id }} | {{ $value | humanize }} конн. | p95.0%"
+                summary_resolved: !unsafe "{{ $labels.telegram_id }} / {{ $value | humanize }} conn. anomaly is resolved."

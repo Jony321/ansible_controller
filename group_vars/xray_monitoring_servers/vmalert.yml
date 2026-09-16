@@ -10,6 +10,7 @@ vmalert_command:
   - '--remoteRead.url=http://{{ vmselect_container_name }}:8481/select/0/prometheus'
   - '--remoteWrite.url=http://{{ vminsert_container_name }}:8480/insert/0/prometheus'
   - '--notifier.url=http://{{ alertmanager_container_name }}:9093/'
+  - '--notifier.url=http://monitor.openworld.bot:9093'
   - '--rule=/etc/alerts/*.yml'
   - '-external.url=http://{{ alertmanager_container_name }}:3000'
 
@@ -77,38 +78,95 @@ vmalert_additional_alerts:
               labels:
                 aggregation: common
                 retention: "2d"
-            - record: xray:user_connections:sum
-              expr: |
-                sum by (country, domainname, ipaddress, telegram_id, host) (xray_access[1m])
-              labels:
-                aggregation: user_connections
-                retention: "2d"
 
-            # подсчет коннектов по пользователям (предрассчитанный 5м интервал)
+            # подсчет коннектов по пользователям
             - record: xray:user_connections_5m:increase
               expr: |
-                sum by (
-                  country,
-                  domainname,
-                  ipaddress,
-                  telegram_id,
-                  host
-                ) (
-                  increase(xray_access[5m])
-                )
+                (
+                  sum by (
+                    country,
+                    domainname,
+                    ipaddress,
+                    telegram_id,
+                    host
+                  ) (
+                    increase(xray_access[5m])
+                  )
+                ) > 0
               labels:
                 aggregation: user_connections_5m
                 retention: "2d"
 
-            # суммарно по пользователю (без доменов и IP) ===
+            # суммарно по пользователю
             - record: xray:user_total_connections_5m:increase
               expr: |
-                sum by (
-                  country,
-                  telegram_id
-                ) (
-                  increase(xray_access[5m])
-                )
+                (
+                  sum by (
+                    country,
+                    telegram_id
+                  ) (
+                    increase(xray_access[5m])
+                  )
+                ) > 0
               labels:
                 aggregation: user_total_connections_5m
+                retention: "2d"
+
+            # Перцентили для выявления аномалий
+            - record: xray:user_connections_5m:p50
+              expr: |
+                quantile by (country) (0.50, xray:user_total_connections_5m:increase)
+              labels:
+                aggregation: quantile
+                retention: "2d"
+
+            - record: xray:user_connections_5m:p90
+              expr: |
+                quantile by (country) (0.90, xray:user_total_connections_5m:increase)
+              labels:
+                aggregation: quantile
+                retention: "2d"
+
+            - record: xray:user_connections_5m:p95
+              expr: |
+                quantile by (country) (0.95, xray:user_total_connections_5m:increase)
+              labels:
+                aggregation: quantile
+                retention: "2d"
+
+            - record: xray:user_connections_5m:p99
+              expr: |
+                quantile by (country) (0.99, xray:user_total_connections_5m:increase)
+              labels:
+                aggregation: quantile
+                retention: "2d"
+
+            - record: xray:user_connections_5m:p99_5
+              expr: |
+                quantile by (country) (0.995, xray:user_total_connections_5m:increase)
+              labels:
+                aggregation: quantile
+                retention: "2d"
+
+            - record: xray:user_connections_5m:p99_99
+              expr: |
+                quantile by (country) (0.9999, xray:user_total_connections_5m:increase)
+              labels:
+                aggregation: quantile
+                retention: "2d"
+
+            # Агрегация по действиям (direct / block)
+            - record: xray:actions:sum
+              expr: |
+                sum by (country, domainname, ipaddress, action) (increase(xray_actions[1m]))
+              labels:
+                aggregation: actions
+                retention: "2d"
+
+            # Агрегация по протоколам (tcp / udp)
+            - record: xray:protocols:sum
+              expr: |
+                sum by (country, domainname, ipaddress, protocol) (increase(xray_protocols[1m]))
+              labels:
+                aggregation: protocols
                 retention: "2d"
