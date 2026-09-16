@@ -1,0 +1,219 @@
+---
+- name: 1. Сбор сетевых фактов с Гипервизоров
+  hosts: hypervisors
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Фиксация фактов гипервизора
+      ansible.builtin.set_fact:
+        hyp_ru_ip: "{{ ansible_default_ipv4.address | default('N/A') }}"
+        hyp_de_ips: "{{ (german_ip.split(',') if german_ip is string else german_ip) if german_ip is defined else [] }}"
+
+- name: 2. Сбор фактов ВМ и строчный консольный вывод
+  hosts: tg_proxy_hosts_v2
+  become: true
+  gather_facts: true
+  ignore_unreachable: true
+  throttle: 10
+
+  vars:
+    ip_echo_services:
+      - "https://checkip.amazonaws.com"
+      - "https://api.ipify.org"
+      - "https://ifconfig.co"
+      - "https://icanhazip.com"
+
+  tasks:
+    # --- Сбор фактов с ВМ ---
+    - name: Извлечение локальных IP интерфейсов ВМ (без привязки к ens3/ens4/ens8)
+      ansible.builtin.set_fact:
+        vm_ru_ip: "{{ (ansible_all_ipv4_addresses | default([])) | reject('search', '^10\\.99\\.0\\.') | reject('equalto', '127.0.0.1') | first | default(ansible_default_ipv4.address | default('N/A')) }}"
+        vm_de_private_ip: "{{ (ansible_all_ipv4_addresses | default([])) | select('search', '^10\\.99\\.0\\.') | first | default('N/A') }}"
+      when: "'hypervisors' not in group_names"
+
+    - name: Случайный выбор сервиса для проверки внешнего IP
+      ansible.builtin.set_fact:
+        selected_echo_service: "{{ ip_echo_services | random }}"
+      when: "'hypervisors' not in group_names"
+
+    - name: Проверка фактического внешнего IP через ротируемый сервис
+      ansible.builtin.shell:
+        cmd: "curl -s -4 --connect-timeout 5 {{ selected_echo_service }}"
+      register: external_ip_check
+      until: external_ip_check.rc == 0 and (external_ip_check.stdout | trim is match('^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$'))
+      retries: 3
+      delay: 2
+      failed_when: false
+      changed_when: false
+      when: "'hypervisors' not in group_names"
+
+    - name: Безопасное сохранение внешнего IP ВМ
+      ansible.builtin.set_fact:
+        vm_de_external_ip: "{{ external_ip_check.stdout | trim if (external_ip_check is defined and external_ip_check.rc is defined and external_ip_check.rc == 0 and external_ip_check.stdout is defined) else '' }}"
+      when: "'hypervisors' not in group_names"
+
+    - name: Пауза между запросами ВМ
+      ansible.builtin.pause:
+        seconds: 1
+      when: "'hypervisors' not in group_names"
+
+    # --- Обработка и сохранение отчета на localhost ---
+    - name: Сбор структуры всех узлов и их адресов
+      ansible.builtin.set_fact:
+        all_vm_hosts: "{{ ((groups['vms'] | default([])) + (groups['tg_proxy_hosts_v2'] | default([])) + (groups['german_nic'] | default([]))) | unique }}"
+        vm_facts_map: >-
+          {%- set vms = {} -%}
+          {%- for h in ((groups['vms'] | default([])) + (groups['tg_proxy_hosts_v2'] | default([])) + (groups['german_nic'] | default([]))) | unique -%}
+            {%- if hostvars[h].vm_ru_ip is defined or hostvars[h].ansible_all_ipv4_addresses is defined -%}
+              {%- set ip_list = (hostvars[h].ansible_all_ipv4_addresses | default([])) + ([hostvars[h].ansible_host] if hostvars[h].ansible_host is defined else []) -%}
+              {%- set de_priv = hostvars[h].vm_de_private_ip | default('N/A') -%}
+              {%- set de_ext = hostvars[h].vm_de_external_ip | default('') -%}
+              {%- set _ = vms.update({h: {'ips': ip_list, 'de_private': de_priv, 'de_external': de_ext}}) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ vms | to_json }}
+        hypers_facts_map: >-
+          {%- set hypers = {} -%}
+          {%- for h in groups['hypervisors'] | default([]) -%}
+            {%- if hostvars[h].hyp_ru_ip is defined and hostvars[h].hyp_ru_ip != 'N/A' -%}
+              {%- set de_list = hostvars[h].hyp_de_ips | default([]) -%}
+              {%- set de_str = de_list if (de_list is string) else (de_list | join(', ')) -%}
+              {%- set _ = hypers.update({h: {'ru_ip': hostvars[h].hyp_ru_ip, 'de_external': de_str}}) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ hypers | to_json }}
+      delegate_to: localhost
+      run_once: true
+      become: false
+
+    - name: Генерация отчета в /tmp/ip_inventory_report.txt через Python
+      ansible.builtin.shell:
+        cmd: |
+          python3 - << 'EOF'
+          import json, os, sys
+          from ipaddress import ip_network, ip_address
+
+          possible_paths = [
+              "../../subnets.json",
+          ]
+          
+          subnets_path = None
+          for p in possible_paths:
+              if os.path.exists(p):
+                  subnets_path = p
+                  break
+
+          if not subnets_path:
+              print("ERROR: subnets.json file not found in any known path!")
+              sys.exit(1)
+
+          vms_data = json.loads('''{{ vm_facts_map }}''')
+          hypers_data = json.loads('''{{ hypers_facts_map }}''')
+
+          with open(subnets_path, 'r', encoding='utf-8') as f:
+              subnets = json.load(f)
+
+          active_ips = {}
+
+          # 1. Заносим гипервизоры
+          for h_name, h_info in hypers_data.items():
+              ru_ip = h_info.get('ru_ip')
+              if ru_ip:
+                  active_ips[ru_ip] = {
+                      'name': h_name,
+                      'de_private': 'N/A',
+                      'de_external': h_info.get('de_external', '')
+                  }
+
+          # 2. Заносим ВМ
+          all_nets = [ip_network(s['cidr']) for s in subnets]
+
+          for vm_name, vm_info in vms_data.items():
+              ip_candidates = vm_info.get('ips', [])
+              de_priv = vm_info.get('de_private', 'N/A')
+              de_ext = vm_info.get('de_external', '')
+
+              for cand in ip_candidates:
+                  try:
+                      cand_obj = ip_address(cand)
+                      if cand_obj.is_loopback or cand.startswith("10.99.0."):
+                          continue
+                      
+                      for net in all_nets:
+                          if cand_obj in net:
+                              active_ips[cand] = {
+                                  'name': vm_name,
+                                  'de_private': de_priv,
+                                  'de_external': de_ext
+                              }
+                              break
+                  except ValueError:
+                      continue
+
+          # 3. Формирование блоков вывода
+          b1_lines = ["=== SUBNETS & FREE COUNT ==="]
+          b2_lines = ["=== BLOCKED ADDRESSES ==="]
+          b3_lines = [
+              "=== ALL IP ADDRESSES ===",
+              "1st nic - hostname - 2nd nic - external ip"
+          ]
+
+          all_blocked = []
+
+          for sub in subnets:
+              cidr = sub['cidr']
+              reserved = set(sub.get('reserved', []))
+              blocked = set(sub.get('blocked', []))
+              
+              net = ip_network(cidr)
+              usable = [str(ip) for ip in net.hosts()]
+              
+              free_count = 0
+              for ip in usable:
+                  if ip not in reserved and ip not in blocked and ip not in active_ips:
+                      free_count += 1
+                      
+              b1_lines.append(f"{cidr} - free: {free_count}")
+
+              for b_ip in sorted(list(blocked), key=lambda x: ip_address(x)):
+                  all_blocked.append(b_ip)
+
+              for ip in usable:
+                  if ip in active_ips:
+                      info = active_ips[ip]
+                      host_name = info['name']
+                      
+                      # 2nd nic (серый IP)
+                      de_priv = info.get('de_private', '').strip()
+                      nic2_display = de_priv if (de_priv and de_priv != 'N/A') else 'N/A'
+                      
+                      # external ip (резолв через curl)
+                      de_ext = info.get('de_external', '').strip()
+                      if not de_ext or de_ext in ['N/A', 'TIMEOUT/ERROR', 'None']:
+                          ext_display = 'N/A'
+                      else:
+                          ext_display = de_ext
+
+                      b3_lines.append(f"{ip} - {host_name} - {nic2_display} - {ext_display}")
+                  elif ip in reserved:
+                      b3_lines.append(f"{ip} - reserved")
+                  elif ip in blocked:
+                      b3_lines.append(f"{ip} - blocked")
+                  else:
+                      b3_lines.append(f"{ip}")
+
+          if all_blocked:
+              for b in all_blocked:
+                  b2_lines.append(f"{b}")
+          else:
+              b2_lines.append("none")
+
+          output = "\n".join(b1_lines) + "\n\n" + "\n".join(b2_lines) + "\n\n" + "\n".join(b3_lines)
+          
+          with open('/tmp/ip_inventory_report.txt', 'w', encoding='utf-8') as out_file:
+              out_file.write(output)
+          EOF
+      delegate_to: localhost
+      run_once: true
+      become: false
